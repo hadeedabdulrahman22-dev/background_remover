@@ -1,17 +1,13 @@
-# background_remover
+# ClearCut - Background Remover
 
-A new Flutter project.
+A web application that removes image backgrounds and exports transparent PNGs.
 
-## Getting Started
+## Features
 
-This project is a starting point for a Flutter application.
+- **One-Click Cutout**: Removes backgrounds using AI neural edge segmentation.
+- **Interactive Comparison**: Before/After split slider to inspect edge accuracy.
+- **Custom Backdrops**: Preview on transparent checkerboard, solid colors (white, mint, dark ink, sky blue), or gradients.
+- **Multiple Input Methods**: File drag & drop, file browser, live webcam capture, or instant sample photos.
+- **Export**: Download transparent PNG or solid color composited images.
+- **No API Key Required**: Built-in backend proxy to the ClearCut model API.
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.

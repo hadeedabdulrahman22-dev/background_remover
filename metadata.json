@@ -1,0 +1,10 @@
+{
+  "name": "ClearCut - Background Remover",
+  "description": "Remove image backgrounds instantly and export high-quality transparent PNGs.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
