@@ -1,20 +1,33 @@
-import { BackgroundOption } from '../types';
+import { removeBackground } from '@imgly/background-removal';
+import { BackgroundOption, ImageFilter, ResizeOptions } from '../types';
 
-/**
- * Creates a downloadable PNG file from the result image, applying any custom background color or preserving alpha transparency.
- */
+export function getCssFilterString(filter: ImageFilter): string {
+  switch (filter) {
+    case 'grayscale': return 'grayscale(100%)';
+    case 'sepia': return 'sepia(100%)';
+    case 'contrast': return 'contrast(150%)';
+    default: return 'none';
+  }
+}
+
 export async function exportImage(
   resultUrl: string,
   background: BackgroundOption,
   customColor: string,
-  baseFileName: string = 'clearcut'
+  baseFileName: string = 'clearcut',
+  format: 'png' | 'jpg' = 'png',
+  bgFilter: ImageFilter = 'none',
+  cutoutFilter: ImageFilter = 'none',
+  resizeOptions?: ResizeOptions
 ): Promise<void> {
   const timestamp = Date.now();
   const cleanName = baseFileName.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const downloadFileName = `${cleanName}_nobg_${timestamp}.png`;
+  const ext = format === 'jpg' ? 'jpg' : 'png';
+  const downloadFileName = `${cleanName}_nobg_${timestamp}.${ext}`;
 
-  // If transparent background is selected, download directly from blob/data URL without re-encoding
-  if (background.type === 'transparent') {
+  const hasResize = resizeOptions && resizeOptions.mode !== 'original';
+  const hasFilter = bgFilter !== 'none' || cutoutFilter !== 'none';
+  if (background.type === 'transparent' && format === 'png' && !hasResize && !hasFilter) {
     const a = document.createElement('a');
     a.href = resultUrl;
     a.download = downloadFileName;
@@ -26,26 +39,38 @@ export async function exportImage(
     return;
   }
 
-  // If solid color or gradient background is selected, composite onto canvas
   return new Promise((resolve, reject) => {
     const img = new Image();
-
-    // Only set crossOrigin for external remote URLs, NEVER for blob: or data: URLs (which cause CORS error events)
     if (!resultUrl.startsWith('blob:') && !resultUrl.startsWith('data:')) {
       img.crossOrigin = 'anonymous';
     }
-
     img.onload = () => {
       try {
+        const origWidth = img.naturalWidth || img.width || 800;
+        const origHeight = img.naturalHeight || img.height || 600;
+        
+        let targetWidth = origWidth;
+        let targetHeight = origHeight;
+
+        if (resizeOptions && resizeOptions.mode !== 'original') {
+          if (resizeOptions.mode === 'percentage') {
+            targetWidth = Math.round(origWidth * (resizeOptions.percentage / 100));
+            targetHeight = Math.round(origHeight * (resizeOptions.percentage / 100));
+          } else if (resizeOptions.mode === 'dimensions') {
+            targetWidth = resizeOptions.width || origWidth;
+            targetHeight = resizeOptions.height || origHeight;
+          }
+        }
+
         const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth || img.width || 800;
-        canvas.height = img.naturalHeight || img.height || 600;
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
         const ctx = canvas.getContext('2d');
         if (!ctx) {
           throw new Error('Canvas context could not be created');
         }
 
-        // Draw background
+        ctx.filter = getCssFilterString(bgFilter);
         if (background.type === 'color') {
           ctx.fillStyle = background.id === 'custom' ? customColor : background.value;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -63,56 +88,55 @@ export async function exportImage(
           }
           ctx.fillStyle = grad;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (background.type === 'transparent' && format === 'jpg') {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
-        // Draw cutout on top
-        ctx.drawImage(img, 0, 0);
+        ctx.filter = getCssFilterString(cutoutFilter);
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+        ctx.filter = 'none';
 
-        // Export as PNG
+        const mimeType = format === 'jpg' ? 'image/jpeg' : 'image/png';
+        const quality = format === 'jpg' ? 0.92 : undefined;
+
         canvas.toBlob((blob) => {
           if (!blob) {
             reject(new Error('Canvas blob generation failed'));
             return;
           }
-          const blobUrl = URL.createObjectURL(blob);
+          const outputUrl = URL.createObjectURL(blob);
           const a = document.createElement('a');
-          a.href = blobUrl;
+          a.href = outputUrl;
           a.download = downloadFileName;
           document.body.appendChild(a);
           a.click();
           setTimeout(() => {
             document.body.removeChild(a);
-            URL.revokeObjectURL(blobUrl);
+            URL.revokeObjectURL(outputUrl);
+            resolve();
           }, 100);
-          resolve();
-        }, 'image/png');
-      } catch (err: any) {
-        reject(new Error(err?.message || 'Error compositing image with background'));
+        }, mimeType, quality);
+      } catch (err) {
+        reject(err);
       }
     };
-
-    img.onerror = () => {
-      reject(new Error('Failed to load cutout image for exporting'));
-    };
-
+    img.onerror = () => reject(new Error('Failed to load image onto canvas for export'));
     img.src = resultUrl;
   });
 }
 
-/**
- * Converts a data URL or Blob to a File object
- */
 export async function applyBackgroundToCanvas(
-  resultUrl: string,
+  sourceUrl: string,
   background: BackgroundOption,
-  customColor: string
+  customColor: string,
+  format: 'png' | 'jpg' = 'png'
 ): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    if (!resultUrl.startsWith('blob:') && !resultUrl.startsWith('data:')) {
+    if (!sourceUrl.startsWith('blob:') && !sourceUrl.startsWith('data:')) {
       img.crossOrigin = 'anonymous';
     }
-
     img.onload = () => {
       try {
         const canvas = document.createElement('canvas');
@@ -138,25 +162,166 @@ export async function applyBackgroundToCanvas(
           }
           ctx.fillStyle = grad;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (background.type === 'transparent' && format === 'jpg') {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
         ctx.drawImage(img, 0, 0);
 
+        const mimeType = format === 'jpg' ? 'image/jpeg' : 'image/png';
+        const quality = format === 'jpg' ? 0.92 : undefined;
+
         canvas.toBlob((blob) => {
           if (blob) resolve(blob);
-          else reject(new Error('Blob generation failed'));
-        }, 'image/png');
+          else reject(new Error('Canvas toBlob failed'));
+        }, mimeType, quality);
       } catch (err) {
         reject(err);
       }
     };
-    img.onerror = () => reject(new Error('Failed to load cutout image'));
-    img.src = resultUrl;
+    img.onerror = () => reject(new Error('Failed to load image for background application'));
+    img.src = sourceUrl;
   });
 }
 
-export function blobToFile(blob: Blob, fileName: string): File {
-  return new File([blob], fileName, { type: blob.type || 'image/png' });
+export async function optimizeImageBeforeUpload(blob: Blob, maxDim = 1600): Promise<Blob> {
+  // If smaller than 400KB, no need to downscale
+  if (blob.size < 400 * 1024) return blob;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      if (w <= maxDim && h <= maxDim && blob.size < 1200 * 1024) {
+        return resolve(blob);
+      }
+      let targetW = w;
+      let targetH = h;
+      if (w > h) {
+        if (w > maxDim) {
+          targetW = maxDim;
+          targetH = Math.round((h * maxDim) / w);
+        }
+      } else {
+        if (h > maxDim) {
+          targetH = maxDim;
+          targetW = Math.round((w * maxDim) / h);
+        }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return resolve(blob);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, targetW, targetH);
+      canvas.toBlob((resizedBlob) => {
+        if (resizedBlob && resizedBlob.size < blob.size) {
+          resolve(resizedBlob);
+        } else {
+          resolve(blob);
+        }
+      }, 'image/jpeg', 0.93);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(blob);
+    };
+    img.src = url;
+  });
+}
+
+export async function removeBackgroundServer(source: File | string, fileName: string = 'image.png'): Promise<Blob> {
+  const formData = new FormData();
+
+  if (source instanceof File) {
+    const optimized = await optimizeImageBeforeUpload(source);
+    formData.append('file', optimized, source.name || fileName);
+    formData.append('format', 'png');
+  } else if (typeof source === 'string') {
+    let blob: Blob;
+    if (source.startsWith('data:')) {
+      const arr = source.split(',');
+      const mimeMatch = arr[0].match(/:(.*?);/);
+      const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+      const bstr = atob(arr[1]);
+      let n = bstr.length;
+      const u8arr = new Uint8Array(n);
+      while (n--) {
+        u8arr[n] = bstr.charCodeAt(n);
+      }
+      blob = new Blob([u8arr], { type: mime });
+    } else if (source.startsWith('blob:') || source.startsWith('/') || !source.startsWith('http')) {
+      const res = await fetch(source);
+      blob = await res.blob();
+    } else {
+      const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(source)}`;
+      const res = await fetch(proxyUrl);
+      if (!res.ok) throw new Error('Could not fetch image to process.');
+      blob = await res.blob();
+    }
+    const optimized = await optimizeImageBeforeUpload(blob);
+    const file = new File([optimized], fileName, { type: optimized.type || 'image/png' });
+    formData.append('file', file, fileName);
+    formData.append('format', 'png');
+  } else {
+    throw new Error('Unsupported image source type.');
+  }
+
+  const response = await fetch('/api/remove-background', {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || errorData.details || `Background removal request failed (${response.status})`);
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const json = await response.json();
+    if (json.fallbackRequired) {
+      const sourceUrl = source instanceof File ? URL.createObjectURL(source) : source;
+      try {
+        return await removeBackgroundClientSide(sourceUrl);
+      } finally {
+        if (source instanceof File) URL.revokeObjectURL(sourceUrl);
+      }
+    }
+    throw new Error(json.error || 'Server did not return cutout image.');
+  }
+
+  const resultBlob = await response.blob();
+  if (resultBlob.size === 0) {
+    throw new Error('Empty image result received from server.');
+  }
+  return resultBlob;
+}
+
+export async function removeBackgroundClientSide(imageSrc: string, onProgress?: (progress: number) => void): Promise<Blob> {
+  console.log("Running client-side background removal fallback...");
+  try {
+    const config = {
+      model: 'isnet_quint8' as const,
+      device: 'cpu' as const,
+      progress: (key: string, current: number, total: number) => {
+        if (onProgress && total > 0) {
+          onProgress(current / total);
+        }
+      }
+    };
+    const blob = await removeBackground(imageSrc, config);
+    return blob;
+  } catch (err: any) {
+    console.warn("Client-side background removal failed:", err);
+    throw new Error('Background removal failed: could not isolate subject. Please try another image.');
+  }
 }
 
 export async function applyCropToImage(
@@ -175,7 +340,6 @@ export async function applyCropToImage(
         canvas.height = cropRect.height;
         const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error('No 2d context');
-
         ctx.drawImage(
           image,
           cropRect.x,
@@ -187,7 +351,6 @@ export async function applyCropToImage(
           cropRect.width,
           cropRect.height
         );
-
         canvas.toBlob((blob) => {
           if (blob) resolve(blob);
           else reject(new Error('Canvas is empty'));
@@ -201,148 +364,34 @@ export async function applyCropToImage(
   });
 }
 
-export async function removeBackgroundServer(source: File | string, fileName?: string): Promise<Blob> {
-  const formData = new FormData();
-  
-  if (source instanceof File) {
-    formData.append('file', source);
-  } else {
-    // If it's a blob URL from client-side cropping, we need to fetch it first to convert to blob
-    const response = await fetch(source);
-    const blob = await response.blob();
-    formData.append('file', blob, fileName || 'upload.png');
-  }
-
-  const endpoint = '/api/remove-background';
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    body: formData,
-  });
-
-  const contentType = response.headers.get('content-type') || '';
-
-  if (response.ok && contentType.includes('image/')) {
-    return await response.blob();
-  }
-
-  if (response.ok) {
-    const jsonData = await response.json().catch(() => ({}));
-    if (jsonData.fallbackRequired) {
-      console.log('Server requested client-side fallback...');
-      const fallbackUrl = source instanceof File ? URL.createObjectURL(source) : source;
-      try {
-        const fallbackBlob = await removeBackgroundClientSide(fallbackUrl);
-        if (source instanceof File) URL.revokeObjectURL(fallbackUrl);
-        return fallbackBlob;
-      } catch (err) {
-        if (source instanceof File) URL.revokeObjectURL(fallbackUrl);
-        throw err;
-      }
-    }
-  }
-
-  // If server returned non-OK status, try client-side edge segmentation before showing error
-  console.log('Server response non-OK, applying client-side segmentation fallback...');
-  const fallbackUrl = source instanceof File ? URL.createObjectURL(source) : source;
-  try {
-    const fallbackBlob = await removeBackgroundClientSide(fallbackUrl);
-    if (source instanceof File) URL.revokeObjectURL(fallbackUrl);
-    return fallbackBlob;
-  } catch (err) {
-    if (source instanceof File) URL.revokeObjectURL(fallbackUrl);
-    throw new Error('Background removal failed');
-  }
-}
-
-/**
- * Client-side smart edge/background extraction fallback
- */
-export async function removeBackgroundClientSide(imageSrc: string): Promise<Blob> {
+export async function rotateImage(imageUrl: string, angle: number = 90): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    if (!imageSrc.startsWith('blob:') && !imageSrc.startsWith('data:')) {
-      img.crossOrigin = 'anonymous';
-    }
-
+    img.crossOrigin = 'anonymous';
     img.onload = () => {
       try {
-        const width = img.naturalWidth || img.width;
-        const height = img.naturalHeight || img.height;
         const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error('Could not get canvas context');
-
-        ctx.drawImage(img, 0, 0);
-        const imgData = ctx.getImageData(0, 0, width, height);
-        const data = imgData.data;
-
-        // Sample background color from corners and borders
-        const samples: [number, number, number][] = [];
-        const samplePoints = [
-          [2, 2], [width - 3, 2], [2, height - 3], [width - 3, height - 3],
-          [Math.floor(width / 2), 2], [Math.floor(width / 2), height - 3],
-          [2, Math.floor(height / 2)], [width - 3, Math.floor(height / 2)]
-        ];
-
-        for (const [sx, sy] of samplePoints) {
-          const idx = (sy * width + sx) * 4;
-          samples.push([data[idx], data[idx + 1], data[idx + 2]]);
+        if (angle % 180 !== 0) {
+          canvas.width = img.naturalHeight || img.height;
+          canvas.height = img.naturalWidth || img.width;
+        } else {
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
         }
-
-        // Calculate average background color
-        let bgR = 0, bgG = 0, bgB = 0;
-        for (const [r, g, b] of samples) {
-          bgR += r;
-          bgG += g;
-          bgB += b;
-        }
-        bgR /= samples.length;
-        bgG /= samples.length;
-        bgB /= samples.length;
-
-        // Flood-like alpha mask calculation with soft edge blending
-        const tolerance = 45;
-        const softRange = 25;
-
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-
-          // Compute color distance to background sample
-          let minDiff = 999999;
-          for (const [sr, sg, sb] of samples) {
-            const diff = Math.sqrt(
-              Math.pow(r - sr, 2) * 0.299 +
-              Math.pow(g - sg, 2) * 0.587 +
-              Math.pow(b - sb, 2) * 0.114
-            );
-            if (diff < minDiff) minDiff = diff;
-          }
-
-          if (minDiff < tolerance) {
-            data[i + 3] = 0; // completely transparent
-          } else if (minDiff < tolerance + softRange) {
-            const factor = (minDiff - tolerance) / softRange;
-            data[i + 3] = Math.round(255 * factor); // soft antialiased edge
-          }
-        }
-
-        ctx.putImageData(imgData, 0, 0);
-
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate((angle * Math.PI) / 180);
+        ctx.drawImage(img, -img.width / 2, -img.height / 2);
         canvas.toBlob((blob) => {
           if (blob) resolve(blob);
-          else reject(new Error('Canvas toBlob failed'));
+          else reject(new Error('Failed to create rotated blob'));
         }, 'image/png');
-      } catch (err: any) {
+      } catch (err) {
         reject(err);
       }
     };
-
-    img.onerror = () => reject(new Error('Failed to load image for client-side processing'));
-    img.src = imageSrc;
+    img.onerror = () => reject(new Error('Failed to load image for rotation'));
+    img.src = imageUrl;
   });
 }
-

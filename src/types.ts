@@ -28,3 +28,13 @@ export interface BatchItem {
   resultUrl?: string;
   error?: string;
 }
+
+export type ImageFilter = 'none' | 'grayscale' | 'sepia' | 'contrast';
+
+export type ResizeMode = 'original' | 'percentage' | 'dimensions';
+export interface ResizeOptions {
+  mode: ResizeMode;
+  percentage: number; // e.g. 50 for 50%
+  width: number;
+  height: number;
+}

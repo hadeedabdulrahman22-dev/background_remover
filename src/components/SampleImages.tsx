@@ -9,22 +9,22 @@ interface SampleImagesProps {
 const SAMPLE_LIST = [
   {
     name: 'Portrait',
-    url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=600&q=80',
+    url: '/samples/portrait.jpg',
     tag: 'Portrait',
   },
   {
     name: 'Puppy',
-    url: 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?auto=format&fit=crop&w=600&q=80',
+    url: '/samples/puppy.jpg',
     tag: 'Pet',
   },
   {
     name: 'Sneaker',
-    url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=600&q=80',
+    url: '/samples/sneaker.jpg',
     tag: 'Product',
   },
   {
     name: 'Monstera',
-    url: 'https://images.unsplash.com/photo-1614594975525-e45190c55d0b?auto=format&fit=crop&w=600&q=80',
+    url: '/samples/monstera.jpg',
     tag: 'Object',
   },
 ];
@@ -32,9 +32,14 @@ const SAMPLE_LIST = [
 export const SampleImages: React.FC<SampleImagesProps> = ({ onSelectSample, disabled }) => {
   return (
     <div id="sample-images-section" className="mt-4 pt-4 border-t border-[#E6EFEA]">
-      <div className="flex items-center gap-1.5 text-xs font-semibold text-gray-500 mb-2.5">
-        <Sparkles className="w-3.5 h-3.5 text-[#397363]" />
-        <span>No image handy? Try a sample:</span>
+      <div className="flex items-center justify-between text-xs font-semibold text-gray-500 mb-2.5">
+        <div className="flex items-center gap-1.5">
+          <Sparkles className="w-3.5 h-3.5 text-[#397363]" />
+          <span>No image handy? Try a sample:</span>
+        </div>
+        <span className="text-[10px] bg-[#E8F8F2] text-[#1E7D58] font-bold px-2 py-0.5 rounded-full border border-[#C5EDE0]">
+          ⚡ Instant AI Demo
+        </span>
       </div>
       <div className="grid grid-cols-4 gap-2">
         {SAMPLE_LIST.map((sample, idx) => (

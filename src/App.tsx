@@ -1,13 +1,17 @@
-import React, { useState } from 'react';
-import { WorkState, BackgroundOption, AppMode } from './types';
+import React, { useState, useEffect } from 'react';
+import { WorkState, BackgroundOption, AppMode, ImageFilter } from './types';
 import { Header } from './components/Header';
 import { PreviewCard } from './components/PreviewCard';
 import { FeatureStrip } from './components/FeatureStrip';
 import { BackgroundCustomizer, PRESET_BACKGROUNDS } from './components/BackgroundCustomizer';
+import { FilterCustomizer } from './components/FilterCustomizer';
+import { ResizeCustomizer } from './components/ResizeCustomizer';
+import { ResizeOptions } from './types';
 import { CameraCaptureModal } from './components/CameraCaptureModal';
+import { CutoutRefinerModal } from './components/CutoutRefinerModal';
 import { BatchProcessor } from './components/BatchProcessor';
-import { exportImage, removeBackgroundClientSide, applyCropToImage, removeBackgroundServer } from './utils/imageUtils';
-import { Sparkles, Download, RefreshCw, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { exportImage, removeBackgroundClientSide, applyCropToImage, removeBackgroundServer, rotateImage } from './utils/imageUtils';
+import { Sparkles, Download, RefreshCw, AlertCircle, CheckCircle2, Eraser, Scissors, Magnet } from 'lucide-react';
 
 const MAX_BYTES = 25 * 1024 * 1024; // 25MB
 const ALLOWED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp'];
@@ -22,9 +26,38 @@ export const App: React.FC = () => {
   const [fileSize, setFileSize] = useState<number>(0);
   const [selectedBg, setSelectedBg] = useState<BackgroundOption>(PRESET_BACKGROUNDS[0]);
   const [customColor, setCustomColor] = useState<string>('#FFFFFF');
+  const [bgFilter, setBgFilter] = useState<ImageFilter>('none');
+  const [cutoutFilter, setCutoutFilter] = useState<ImageFilter>('none');
+  const [resizeOptions, setResizeOptions] = useState<ResizeOptions>({
+    mode: 'original',
+    percentage: 100,
+    width: 0,
+    height: 0,
+  });
+  const [originalDimensions, setOriginalDimensions] = useState<{width: number, height: number} | undefined>(undefined);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [isCropping, setIsCropping] = useState(false);
+  const [isRefining, setIsRefining] = useState(false);
   const [notification, setNotification] = useState<{ message: string; type: 'info' | 'success' | 'error' } | null>(null);
+
+  const handleRefineApply = (refinedBlob: Blob) => {
+    const newUrl = URL.createObjectURL(refinedBlob);
+    setResultUrl(newUrl);
+    setState('done');
+    showNotification('Cutout refined! Leftover background removed.', 'success');
+  };
+
+  
+  useEffect(() => {
+    if (resultUrl) {
+      const img = new Image();
+      img.onload = () => {
+        setOriginalDimensions({ width: img.naturalWidth, height: img.naturalHeight });
+        setResizeOptions(prev => ({ ...prev, width: img.naturalWidth, height: img.naturalHeight }));
+      };
+      img.src = resultUrl;
+    }
+  }, [resultUrl]);
 
   const showNotification = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     setNotification({ message, type });
@@ -65,9 +98,41 @@ export const App: React.FC = () => {
       setIsCropping(false);
       showNotification('Image cropped successfully!', 'success');
     } catch (err: any) {
-      console.error(err);
+      console.warn('Crop image error:', err);
       setIsCropping(false);
       showNotification('Failed to crop image.', 'error');
+    }
+  };
+
+  const handleRotate = async () => {
+    try {
+      showNotification('Rotating image...', 'info');
+      let newSourceUrl = sourceUrl;
+      let newResultUrl = resultUrl;
+      let newSourceFile = sourceFile;
+
+      if (sourceUrl) {
+        const rotatedSourceBlob = await rotateImage(sourceUrl, 90);
+        newSourceUrl = URL.createObjectURL(rotatedSourceBlob);
+        if (sourceFile) {
+          newSourceFile = new File([rotatedSourceBlob], sourceFile.name, { type: rotatedSourceBlob.type });
+        } else {
+          newSourceFile = new File([rotatedSourceBlob], fileName || 'rotated.png', { type: rotatedSourceBlob.type });
+        }
+      }
+
+      if (resultUrl) {
+        const rotatedResultBlob = await rotateImage(resultUrl, 90);
+        newResultUrl = URL.createObjectURL(rotatedResultBlob);
+      }
+
+      setSourceUrl(newSourceUrl);
+      setSourceFile(newSourceFile);
+      if (newResultUrl) setResultUrl(newResultUrl);
+      
+    } catch (err: any) {
+      console.warn('Rotate image error:', err);
+      showNotification('Failed to rotate image.', 'error');
     }
   };
 
@@ -99,12 +164,15 @@ export const App: React.FC = () => {
   const handleSelectSample = async (url: string, name: string) => {
     try {
       showNotification('Loading sample image...', 'info');
-      // Use proxy endpoint to bypass any cross-origin blocks
-      const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
-      let response = await fetch(proxyUrl).catch(() => null);
-
-      if (!response || !response.ok) {
+      let response: Response | null = null;
+      if (url.startsWith('/') || !url.startsWith('http')) {
         response = await fetch(url);
+      } else {
+        const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+        response = await fetch(proxyUrl).catch(() => null);
+        if (!response || !response.ok) {
+          response = await fetch(url);
+        }
       }
 
       const blob = await response.blob();
@@ -153,25 +221,26 @@ export const App: React.FC = () => {
     setState('processing');
 
     try {
-      const resultBlob = await removeBackgroundServer(sourceUrl || sourceFile!);
+      const resultBlob = await removeBackgroundServer(sourceFile || sourceUrl!, fileName || 'upload.png');
       const outputUrl = URL.createObjectURL(resultBlob);
       setResultUrl(outputUrl);
       setState('done');
       showNotification('Background cut out cleanly!', 'success');
     } catch (err: any) {
-      console.warn('Server removal attempt error:', err);
+      console.warn('Background removal error:', err);
       setState('ready');
-      showNotification('Could not process background removal. Please try another image.', 'error');
+      showNotification(err?.message || 'Could not process background removal. Please try another image.', 'error');
     }
   };
 
-  const handleSaveResult = async () => {
+  const handleSaveResult = async (format: 'png' | 'jpg' = 'png') => {
     if (!resultUrl) return;
     try {
-      await exportImage(resultUrl, selectedBg, customColor, fileName || 'clearcut');
-      showNotification('Transparent image saved to downloads!', 'success');
+      await exportImage(resultUrl, selectedBg, customColor, fileName || 'clearcut', format, bgFilter, cutoutFilter, resizeOptions);
+      const formatLabel = format === 'jpg' ? 'JPG' : 'PNG';
+      showNotification(`Image saved as ${formatLabel} to downloads!`, 'success');
     } catch (err: any) {
-      console.error('Save error:', err);
+      console.warn('Save image error:', err);
       showNotification(err?.message || 'Could not save the image. Please try again.', 'error');
     }
   };
@@ -276,10 +345,14 @@ export const App: React.FC = () => {
               onOpenCamera={() => setIsCameraOpen(true)}
               selectedBg={selectedBg}
               customColor={customColor}
+              bgFilter={bgFilter}
+              cutoutFilter={cutoutFilter}
               isCropping={isCropping}
               onCropStart={() => setIsCropping(true)}
               onCropCancel={() => setIsCropping(false)}
               onCropApply={handleCropApply}
+              onRotate={handleRotate}
+              onRefineCutout={() => setIsRefining(true)}
             />
           )}
         </div>
@@ -293,18 +366,34 @@ export const App: React.FC = () => {
             onCustomColorChange={setCustomColor}
           />
         )}
+        {state === 'done' && (
+          <>
+            <FilterCustomizer bgFilter={bgFilter} setBgFilter={setBgFilter} cutoutFilter={cutoutFilter} setCutoutFilter={setCutoutFilter} />
+            <ResizeCustomizer resizeOptions={resizeOptions} setResizeOptions={setResizeOptions} originalDimensions={originalDimensions} />
+          </>
+        )}
 
         {/* Action Controls */}
         <div className="flex flex-col gap-3">
           {state === 'ready' && (
-            <button
-              id="btn-remove-background"
-              onClick={handleRemoveBackground}
-              className="w-full py-4 px-6 bg-[#10231F] hover:bg-[#17332D] text-white font-extrabold text-base rounded-2xl flex items-center justify-center gap-2.5 shadow-lg transition-all hover:scale-101 active:scale-98 cursor-pointer"
-            >
-              <Sparkles className="w-5 h-5 text-[#5EE0B5]" />
-              <span>Remove background</span>
-            </button>
+            <div className="flex flex-col gap-2">
+              <button
+                id="btn-remove-background"
+                onClick={handleRemoveBackground}
+                className="w-full py-4 px-6 bg-[#10231F] hover:bg-[#17332D] text-white font-extrabold text-base rounded-2xl flex items-center justify-center gap-2.5 shadow-lg transition-all hover:scale-101 active:scale-98 cursor-pointer"
+              >
+                <Sparkles className="w-5 h-5 text-[#5EE0B5]" />
+                <span>Remove background</span>
+              </button>
+              <button
+                id="btn-manual-cutout-ready"
+                onClick={() => setIsRefining(true)}
+                className="w-full py-3 px-4 bg-white hover:bg-[#F3F7F5] border border-[#CCDCD5] text-[#10231F] font-bold text-sm rounded-2xl flex items-center justify-center gap-2 shadow-xs transition-all hover:scale-101 active:scale-98 cursor-pointer"
+              >
+                <Magnet className="w-4 h-4 text-[#176B51]" />
+                <span>Smart Snap Cutout (Draw line to auto-snap to object)</span>
+              </button>
+            </div>
           )}
 
           {state === 'processing' && (
@@ -320,18 +409,45 @@ export const App: React.FC = () => {
 
           {state === 'done' && (
             <div className="flex flex-col gap-2.5">
+              {/* Smart Edge-Snap & Leftover Eraser Action */}
               <button
-                id="btn-save-result"
-                onClick={handleSaveResult}
-                className="w-full py-4 px-6 bg-[#10231F] hover:bg-[#17332D] text-white font-extrabold text-base rounded-2xl flex items-center justify-center gap-2.5 shadow-lg transition-all hover:scale-101 active:scale-98 cursor-pointer"
+                id="btn-open-touchup"
+                onClick={() => setIsRefining(true)}
+                className="w-full py-3.5 px-4 bg-white hover:bg-[#F0F6F3] border-2 border-[#10231F] text-[#10231F] font-extrabold text-sm sm:text-base rounded-2xl flex items-center justify-center gap-2 shadow-xs transition-all hover:scale-101 active:scale-98 cursor-pointer"
               >
-                <Download className="w-5 h-5 text-[#5EE0B5]" />
-                <span>
-                  {selectedBg.type === 'transparent'
-                    ? 'Save transparent PNG'
-                    : `Save with ${selectedBg.name}`}
-                </span>
+                <Magnet className="w-4 h-4 text-[#176B51]" />
+                <span>Smart Snap & Erase Leftovers (Draw line beside object to snap)</span>
               </button>
+
+              {selectedBg.type === 'transparent' ? (
+                <button
+                  id="btn-save-result"
+                  onClick={() => handleSaveResult('png')}
+                  className="w-full py-4 px-6 bg-[#10231F] hover:bg-[#17332D] text-white font-extrabold text-base rounded-2xl flex items-center justify-center gap-2.5 shadow-lg transition-all hover:scale-101 active:scale-98 cursor-pointer"
+                >
+                  <Download className="w-5 h-5 text-[#5EE0B5]" />
+                  <span>Save transparent PNG</span>
+                </button>
+              ) : (
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <button
+                    id="btn-save-result-png"
+                    onClick={() => handleSaveResult('png')}
+                    className="flex-1 py-3.5 px-4 bg-[#10231F] hover:bg-[#17332D] text-white font-extrabold text-sm sm:text-base rounded-2xl flex items-center justify-center gap-2 shadow-lg transition-all hover:scale-101 active:scale-98 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4 text-[#5EE0B5]" />
+                    <span>Save PNG</span>
+                  </button>
+                  <button
+                    id="btn-save-result-jpg"
+                    onClick={() => handleSaveResult('jpg')}
+                    className="flex-1 py-3.5 px-4 bg-white hover:bg-[#F3F7F5] border-2 border-[#10231F] text-[#10231F] font-extrabold text-sm sm:text-base rounded-2xl flex items-center justify-center gap-2 shadow-md transition-all hover:scale-101 active:scale-98 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4 text-[#10231F]" />
+                    <span>Save JPG</span>
+                  </button>
+                </div>
+              )}
 
               <button
                 id="btn-start-over"
@@ -354,6 +470,15 @@ export const App: React.FC = () => {
         isOpen={isCameraOpen}
         onClose={() => setIsCameraOpen(false)}
         onCapture={handleCameraCapture}
+      />
+
+      {/* Manual Cutout & Touch-Up Editor Modal */}
+      <CutoutRefinerModal
+        isOpen={isRefining}
+        onClose={() => setIsRefining(false)}
+        sourceUrl={sourceUrl || ''}
+        resultUrl={resultUrl}
+        onApply={handleRefineApply}
       />
     </div>
   );

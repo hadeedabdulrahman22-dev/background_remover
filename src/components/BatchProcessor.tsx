@@ -54,11 +54,11 @@ export const BatchProcessor: React.FC<BatchProcessorProps> = ({ onClose, selecte
     if (isProcessing) return;
     setIsProcessing(true);
 
-    // Sequential processing to avoid overloading the API
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.status === 'done' || item.status === 'processing') continue;
+    const pendingItems = items.filter(i => i.status !== 'done');
+    const concurrency = 2;
+    let currentIndex = 0;
 
+    const processItem = async (item: BatchItem) => {
       setItems(prev => prev.map(p => p.id === item.id ? { ...p, status: 'processing' } : p));
 
       try {
@@ -78,8 +78,18 @@ export const BatchProcessor: React.FC<BatchProcessorProps> = ({ onClose, selecte
           error: err.message || 'Failed'
         } : p));
       }
-    }
+    };
 
+    const workers = Array.from({ length: Math.min(concurrency, pendingItems.length) }, async () => {
+      while (currentIndex < pendingItems.length) {
+        const itemToProcess = pendingItems[currentIndex++];
+        if (itemToProcess) {
+          await processItem(itemToProcess);
+        }
+      }
+    });
+
+    await Promise.all(workers);
     setIsProcessing(false);
   };
 
@@ -118,7 +128,7 @@ export const BatchProcessor: React.FC<BatchProcessorProps> = ({ onClose, selecte
       }, 100);
 
     } catch (err) {
-      console.error('Error zipping files:', err);
+      console.warn('Error zipping files:', err);
     } finally {
       setIsZipping(false);
     }
