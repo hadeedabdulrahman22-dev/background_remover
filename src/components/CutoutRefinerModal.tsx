@@ -25,7 +25,7 @@ import {
   findSnappedEdgePoint,
   executeSnapCutout,
   computeCutoutShape,
-  applyEdgeBarrier,
+  eraseMatchingColorBrush,
   EdgeMapData,
   SnapPointPair,
   CutoutShapeResult,
@@ -98,6 +98,10 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
   const [invertCutSide, setInvertCutSide] = useState<boolean>(false);
   const [cutClearWidth, setCutClearWidth] = useState<number>(45);
   const isSnappingRef = useRef(false);
+
+  // Color-sampling for Smart Background Eraser
+  const sampledColorRef = useRef<{ r: number; g: number; b: number } | null>(null);
+  const [sampledColorPreview, setSampledColorPreview] = useState<{ r: number; g: number; b: number } | null>(null);
 
   // Real-time calculated cutout shape for instant visualization
   const cutoutShape = React.useMemo<CutoutShapeResult | null>(() => {
@@ -331,6 +335,26 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
     };
   };
 
+  // Sample color under coordinates from canvas or original image
+  const sampleColorAt = (x: number, y: number): { r: number; g: number; b: number } | null => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    if (ix < 0 || ix >= canvas.width || iy < 0 || iy >= canvas.height) return null;
+    const p = ctx.getImageData(ix, iy, 1, 1).data;
+    if (p[3] === 0 && originalCanvasRef.current) {
+      const origCtx = originalCanvasRef.current.getContext('2d', { willReadFrequently: true });
+      if (origCtx) {
+        const op = origCtx.getImageData(ix, iy, 1, 1).data;
+        return { r: op[0], g: op[1], b: op[2] };
+      }
+    }
+    return { r: p[0], g: p[1], b: p[2] };
+  };
+
   // Erase or Restore stroke
   const drawStroke = (from: { x: number; y: number }, to: { x: number; y: number }) => {
     const canvas = canvasRef.current;
@@ -347,28 +371,26 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
 
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
-      let cx = from.x + dx * t;
-      let cy = from.y + dy * t;
+      const cx = from.x + dx * t;
+      const cy = from.y + dy * t;
       const radius = brushSize / 2;
 
       if (tool === 'snap_eraser') {
-        ctx.save();
-        // If near an object edge, apply boundary tangent barrier to prevent erasing the subject
-        if (edgeDataRef.current) {
-          const snap = findSnappedEdgePoint(cx, cy, edgeDataRef.current, snapRadius);
-          if (snap.hasSnap) {
-            applyEdgeBarrier(ctx, cx, cy, snap.x, snap.y, radius);
-          }
+        if (sampledColorRef.current) {
+          // Erases only pixels matching the clicked background color, auto-protecting the subject
+          eraseMatchingColorBrush(ctx, cx, cy, radius, sampledColorRef.current, wandTolerance);
+        } else {
+          ctx.save();
+          ctx.globalCompositeOperation = 'destination-out';
+          const grad = ctx.createRadialGradient(cx, cy, radius * (brushHardness / 100), cx, cy, radius);
+          grad.addColorStop(0, 'rgba(0, 0, 0, 1)');
+          grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
         }
-        ctx.globalCompositeOperation = 'destination-out';
-        const grad = ctx.createRadialGradient(cx, cy, radius * (brushHardness / 100), cx, cy, radius);
-        grad.addColorStop(0, 'rgba(0, 0, 0, 1)');
-        grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
       } else if (tool === 'erase') {
         ctx.save();
         ctx.globalCompositeOperation = 'destination-out';
@@ -393,14 +415,14 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
   };
 
   // Execute magnetic cutout along the snapped line
-  const handleApplySnapCut = () => {
+  const handleApplySnapCut = (forceClosed: boolean = false) => {
     if (snapPairs.length < 2) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
-    executeSnapCutout(ctx, snapPairs, cutClearWidth, invertCutSide);
+    executeSnapCutout(ctx, snapPairs, cutClearWidth, invertCutSide, forceClosed);
     setSnapPairs([]);
     pushHistory();
   };
@@ -627,7 +649,17 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
       return;
     }
 
-    if (tool === 'erase' || tool === 'restore' || tool === 'snap_eraser') {
+    if (tool === 'snap_eraser') {
+      const color = sampleColorAt(coords.x, coords.y);
+      sampledColorRef.current = color;
+      setSampledColorPreview(color);
+      isDrawingRef.current = true;
+      lastPointRef.current = coords;
+      drawStroke(coords, coords);
+      return;
+    }
+
+    if (tool === 'erase' || tool === 'restore') {
       isDrawingRef.current = true;
       lastPointRef.current = coords;
       drawStroke(coords, coords);
@@ -737,6 +769,7 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
     if (isDrawingRef.current) {
       isDrawingRef.current = false;
       lastPointRef.current = null;
+      sampledColorRef.current = null;
       pushHistory();
     }
   };
@@ -880,10 +913,10 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
               }`}
             >
               <div className="flex items-center gap-2">
-                <Zap className="w-4 h-4 shrink-0" />
-                <span>Snap-To-Edge Eraser</span>
+                <Sparkles className="w-4 h-4 shrink-0" />
+                <span>Smart Background Brush</span>
               </div>
-              <span className="text-[10px] text-[#A3C8BD] font-mono">No Cut-In</span>
+              <span className="text-[10px] text-[#A3C8BD] font-mono">Auto-Protects</span>
             </button>
 
             <div className="grid grid-cols-2 gap-1.5 mt-1">
@@ -920,7 +953,7 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
                 }`}
               >
                 <Wand2 className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">Magic Color</span>
+                <span className="truncate">1-Tap Island</span>
               </button>
 
               <button
@@ -962,7 +995,7 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
 
               <div>
                 <div className="flex justify-between items-center text-xs text-[#A3C8BD] mb-1">
-                  <span>Snap Magnetism (Reach)</span>
+                  <span>Edge Magnetism (Snap)</span>
                   <span className="text-[11px] text-white/70">
                     {snapRadius <= 25 ? 'Tight' : snapRadius <= 40 ? 'Medium' : 'Wide'}
                   </span>
@@ -979,13 +1012,13 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
 
               <div>
                 <div className="flex justify-between items-center text-xs text-[#A3C8BD] mb-1">
-                  <span>Leftover Removal Reach</span>
+                  <span>Background Removal Width</span>
                   <span className="font-mono text-white text-[11px]">{cutClearWidth}px</span>
                 </div>
                 <input
                   type="range"
                   min="20"
-                  max="120"
+                  max="140"
                   value={cutClearWidth}
                   onChange={(e) => setCutClearWidth(Number(e.target.value))}
                   className="w-full accent-[#5EE0B5] cursor-pointer"
@@ -998,10 +1031,10 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
                 onClick={() => setInvertCutSide((v) => !v)}
                 className="w-full py-1.5 px-2 bg-[#1B3E34] hover:bg-[#234D41] text-white text-xs font-semibold rounded-lg flex items-center justify-between transition-colors border border-[#2E6354] cursor-pointer"
               >
-                <span className="text-[#A3C8BD] text-[11px]">Cutout Side:</span>
+                <span className="text-[#A3C8BD] text-[11px]">Removal Side:</span>
                 <span className="font-bold text-[#5EE0B5] flex items-center gap-1 text-[11px]">
                   <RotateCcw className="w-3 h-3" />
-                  {invertCutSide ? 'Invert (Subject Side)' : 'Leftover Background (Outer)'}
+                  {invertCutSide ? 'Inverted (Subject Side)' : 'Leftover Background (Outer)'}
                 </span>
               </button>
 
@@ -1023,15 +1056,22 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
               {snapPairs.length > 1 && (
                 <div className="flex flex-col gap-1.5 pt-2 border-t border-[#22443A]">
                   <button
-                    onClick={handleApplySnapCut}
+                    onClick={() => handleApplySnapCut(false)}
                     className="w-full py-2 px-3 bg-[#5EE0B5] hover:bg-[#4DD0A5] text-[#10231F] font-extrabold text-xs rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-md"
                   >
                     <Check className="w-4 h-4" />
                     <span>Cut & Remove Red Zone Now</span>
                   </button>
                   <button
+                    onClick={() => handleApplySnapCut(true)}
+                    className="w-full py-1.5 px-3 bg-[#1B3E34] hover:bg-[#234D41] text-[#5EE0B5] font-bold text-xs rounded-lg flex items-center justify-center gap-1.5 transition-colors border border-[#5EE0B5]/40 cursor-pointer"
+                  >
+                    <Scissors className="w-3.5 h-3.5" />
+                    <span>Close Loop & Erase Inside</span>
+                  </button>
+                  <button
                     onClick={() => setSnapPairs([])}
-                    className="w-full py-1.5 px-2 bg-white/10 hover:bg-white/20 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                    className="w-full py-1 px-2 bg-white/10 hover:bg-white/20 text-white text-xs font-semibold rounded-lg cursor-pointer"
                   >
                     Clear Path
                   </button>
@@ -1040,8 +1080,72 @@ export const CutoutRefinerModal: React.FC<CutoutRefinerModalProps> = ({
             </div>
           )}
 
-          {/* Brush Controls (Size & Hardness) */}
-          {(tool === 'erase' || tool === 'restore' || tool === 'snap_eraser') && (
+          {/* Smart Background Eraser Brush Controls */}
+          {tool === 'snap_eraser' && (
+            <div className="flex flex-col gap-3 bg-[#132A23] p-3 rounded-xl border border-[#5EE0B5]/40 animate-in fade-in duration-150">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-extrabold text-[#5EE0B5] flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Smart Background Eraser</span>
+                </span>
+                <span className="text-[10px] px-1.5 py-0.5 bg-[#5EE0B5]/20 text-[#5EE0B5] rounded font-bold uppercase">
+                  Auto-Protects Subject
+                </span>
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center text-xs font-bold text-white mb-1.5">
+                  <span className="text-[#A3C8BD]">Brush Size</span>
+                  <span className="font-mono text-[#5EE0B5]">{brushSize}px</span>
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="140"
+                  value={brushSize}
+                  onChange={(e) => setBrushSize(Number(e.target.value))}
+                  className="w-full accent-[#5EE0B5] cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center text-xs font-bold text-white mb-1.5">
+                  <span className="text-[#A3C8BD]">Color Tolerance</span>
+                  <span className="font-mono text-[#5EE0B5]">{wandTolerance}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="5"
+                  max="80"
+                  value={wandTolerance}
+                  onChange={(e) => setWandTolerance(Number(e.target.value))}
+                  className="w-full accent-[#5EE0B5] cursor-pointer"
+                />
+              </div>
+
+              {sampledColorPreview && (
+                <div className="flex items-center justify-between p-2 bg-[#0E1E1A] rounded-lg border border-[#22443A] text-xs">
+                  <span className="text-[#A3C8BD] text-[11px]">Active Color:</span>
+                  <div className="flex items-center gap-1.5">
+                    <div
+                      className="w-4 h-4 rounded-full border border-white/40 shadow-sm"
+                      style={{ backgroundColor: `rgb(${sampledColorPreview.r}, ${sampledColorPreview.g}, ${sampledColorPreview.b})` }}
+                    />
+                    <span className="font-mono text-white text-[10px]">
+                      rgb({sampledColorPreview.r},{sampledColorPreview.g},{sampledColorPreview.b})
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-[#A3C8BD] leading-relaxed bg-[#0E1E1A]/60 p-2 rounded-lg border border-[#22443A]">
+                💡 <strong>How it works:</strong> Click anywhere on the leftover background and brush over it. It only erases matching background colors, automatically stopping at the subject outline!
+              </p>
+            </div>
+          )}
+
+          {/* Standard Brush Controls (Erase / Restore) */}
+          {(tool === 'erase' || tool === 'restore') && (
             <div className="flex flex-col gap-3 bg-[#132A23] p-3 rounded-xl border border-[#22443A]">
               <div>
                 <div className="flex justify-between items-center text-xs font-bold text-white mb-1.5">

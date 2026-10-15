@@ -19,7 +19,6 @@ export interface CutoutShapeResult {
   polygonPoints: Array<{ x: number; y: number }>;
   snappedContour: Array<{ x: number; y: number }>;
   isClosed: boolean;
-  quads: Array<Array<{ x: number; y: number }>>;
 }
 
 /**
@@ -53,7 +52,6 @@ export function buildEdgeMap(
       }
     }
 
-    // Extract R, G, B, and Alpha into flat 8-bit arrays
     const rArr = new Uint8Array(width * height);
     const gArr = new Uint8Array(width * height);
     const bArr = new Uint8Array(width * height);
@@ -101,7 +99,7 @@ export function buildEdgeMap(
           -bArr[prevRow + x - 1] - 2 * bArr[prevRow + x] - bArr[prevRow + x + 1] +
           bArr[nextRow + x - 1] + 2 * bArr[nextRow + x] + bArr[nextRow + x + 1];
 
-        // Alpha channel gradient (vital for cutout boundaries)
+        // Alpha channel gradient (dominant for cutout boundary)
         const gxA =
           -aArr[prevRow + x - 1] + aArr[prevRow + x + 1] +
           -2 * aArr[rowOffset + x - 1] + 2 * aArr[rowOffset + x + 1] +
@@ -116,7 +114,6 @@ export function buildEdgeMap(
         const magColor = Math.max(magR, magG, magB);
         const magAlpha = Math.abs(gxA) + Math.abs(gyA);
 
-        // Alpha transitions are dominant if present; otherwise strong RGB color contrast
         const total = Math.min(255, (magColor >> 2) + (magAlpha >> 1));
         edgeMap[rowOffset + x] = total;
       }
@@ -166,7 +163,6 @@ export function findSnappedEdgePoint(
       const dist = Math.hypot(cx - targetX, cy - targetY);
       if (dist > r) continue;
 
-      // Score prioritizes high gradient magnitude while gently penalizing distance
       const score = edgeVal * (1 - (dist / r) * 0.42);
 
       if (score > bestScore) {
@@ -216,218 +212,224 @@ export function smoothPoints(
 
 /**
  * Computes the exact polygon and boundary regions to be cut/removed.
- * Guarantees that the cut is strictly bounded on the object side by the snapped contour,
- * while expanding safely outward into the leftover background side.
+ * CRITICAL FIX: Computes a globally consistent normal orientation across the entire curve,
+ * preventing individual per-point normal flipping that caused knots, self-intersections,
+ * and puncturing into the subject.
  */
 export function computeCutoutShape(
   pairs: SnapPointPair[],
-  clearWidth: number = 40,
-  invertSide: boolean = false
+  clearWidth: number = 45,
+  invertSide: boolean = false,
+  forceClosed: boolean = false
 ): CutoutShapeResult | null {
   if (pairs.length < 2) return null;
 
   // Extract raw snapped points and smooth them for sub-pixel contour fidelity
   const rawSnapped = pairs.map((p) => p.snapped);
   const smoothedSnapped = smoothPoints(rawSnapped);
+  const N = smoothedSnapped.length;
+
+  if (N < 2) return null;
 
   // Check if user drew a closed loop (e.g. circling leftover background between arms or torso)
   const firstSnapped = smoothedSnapped[0];
-  const lastSnapped = smoothedSnapped[smoothedSnapped.length - 1];
+  const lastSnapped = smoothedSnapped[N - 1];
   const firstRough = pairs[0].rough;
   const lastRough = pairs[pairs.length - 1].rough;
 
   const snapCloseDist = Math.hypot(firstSnapped.x - lastSnapped.x, firstSnapped.y - lastSnapped.y);
   const roughCloseDist = Math.hypot(firstRough.x - lastRough.x, firstRough.y - lastRough.y);
 
-  const isClosed = pairs.length >= 4 && (snapCloseDist < 36 || roughCloseDist < 40);
+  const isClosed = forceClosed || (pairs.length >= 4 && (snapCloseDist < 36 || roughCloseDist < 40));
 
   if (isClosed) {
     return {
       polygonPoints: smoothedSnapped,
       snappedContour: smoothedSnapped,
       isClosed: true,
-      quads: [],
     };
   }
 
-  // Open stroke along object edge:
-  // Construct the outward boundary in the direction of the leftover background where the user drew
-  const outerPoints: Array<{ x: number; y: number }> = [];
-  const quads: Array<Array<{ x: number; y: number }>> = [];
-  const N = smoothedSnapped.length;
-
+  // 1. Calculate tangent vectors along the snapped curve
+  const tangents: Array<{ ux: number; uy: number }> = [];
   for (let i = 0; i < N; i++) {
-    const s = smoothedSnapped[i];
-    const r = pairs[i].rough;
-
-    // Tangent along the snapped contour
     let tx = 0;
     let ty = 0;
     if (i === 0) {
-      tx = smoothedSnapped[1].x - s.x;
-      ty = smoothedSnapped[1].y - s.y;
+      tx = smoothedSnapped[1].x - smoothedSnapped[0].x;
+      ty = smoothedSnapped[1].y - smoothedSnapped[0].y;
     } else if (i === N - 1) {
-      tx = s.x - smoothedSnapped[N - 2].x;
-      ty = s.y - smoothedSnapped[N - 2].y;
+      tx = smoothedSnapped[N - 1].x - smoothedSnapped[N - 2].x;
+      ty = smoothedSnapped[N - 1].y - smoothedSnapped[N - 2].y;
     } else {
       tx = smoothedSnapped[i + 1].x - smoothedSnapped[i - 1].x;
       ty = smoothedSnapped[i + 1].y - smoothedSnapped[i - 1].y;
     }
 
     const tLen = Math.hypot(tx, ty);
-    let ux = 0;
-    let uy = 1;
     if (tLen > 0.001) {
-      ux = tx / tLen;
-      uy = ty / tLen;
+      tangents.push({ ux: tx / tLen, uy: ty / tLen });
+    } else {
+      tangents.push({ ux: 0, uy: 1 });
     }
+  }
 
-    // Candidate normals perpendicular to contour tangent
-    const nAx = -uy;
-    const nAy = ux;
-    const nBx = uy;
-    const nBy = -ux;
-
-    // Vector from snapped point towards user's rough point (into leftover background)
+  // 2. CRITICAL FIX: Determine GLOBAL dominant side (left vs right) over the entire stroke
+  // This guarantees all normals point to the SAME side with zero flips or twists!
+  let globalDotScore = 0;
+  for (let i = 0; i < N; i++) {
+    const s = smoothedSnapped[i];
+    const r = pairs[i].rough;
+    const t = tangents[i];
+    // Candidate normal A (-uy, ux)
+    const nAx = -t.uy;
+    const nAy = t.ux;
     const vx = r.x - s.x;
     const vy = r.y - s.y;
-    const dotA = vx * nAx + vy * nAy;
+    globalDotScore += vx * nAx + vy * nAy;
+  }
 
-    let chosenNx = dotA >= 0 ? nAx : nBx;
-    let chosenNy = dotA >= 0 ? nAy : nBy;
+  // Dominant normal choice across the entire line
+  const useNormalA = globalDotScore >= 0;
+
+  // 3. Construct smooth outer points along the background side
+  const rawOuter: Array<{ x: number; y: number }> = [];
+  const expandReach = Math.max(25, clearWidth);
+
+  for (let i = 0; i < N; i++) {
+    const s = smoothedSnapped[i];
+    const t = tangents[i];
+    const nAx = -t.uy;
+    const nAy = t.ux;
+
+    let nx = useNormalA ? nAx : -nAx;
+    let ny = useNormalA ? nAy : -nAy;
 
     if (invertSide) {
-      chosenNx = -chosenNx;
-      chosenNy = -chosenNy;
+      nx = -nx;
+      ny = -ny;
     }
 
-    // Distance to expand into background:
-    // User hand distance plus safety clearance
-    const handDist = Math.hypot(vx, vy);
-    const expandDist = Math.max(handDist + clearWidth * 0.6, clearWidth * 1.1);
-
-    const px = s.x + chosenNx * expandDist;
-    const py = s.y + chosenNy * expandDist;
-    outerPoints.push({ x: px, y: py });
+    const px = s.x + nx * expandReach;
+    const py = s.y + ny * expandReach;
+    rawOuter.push({ x: px, y: py });
   }
 
-  // Construct individual convex quadrilaterals for solid, seamless coverage
-  for (let i = 0; i < N - 1; i++) {
-    const s0 = smoothedSnapped[i];
-    const s1 = smoothedSnapped[i + 1];
-    const p1 = outerPoints[i + 1];
-    const p0 = outerPoints[i];
-    quads.push([s0, s1, p1, p0]);
-  }
+  // Smooth outer points for fluid, natural boundary
+  const smoothedOuter = smoothPoints(rawOuter);
 
-  // Overall outer perimeter polygon:
-  // S_0 -> S_1 -> ... -> S_N -> P_N -> P_{N-1} -> ... -> P_0
+  // 4. Construct solid ribbon polygon:
+  // S_0 -> S_1 -> ... -> S_{N-1} -> P_{N-1} -> ... -> P_1 -> P_0
   const polygonPoints: Array<{ x: number; y: number }> = [
     ...smoothedSnapped,
-    ...outerPoints.slice().reverse(),
+    ...smoothedOuter.slice().reverse(),
   ];
 
   return {
     polygonPoints,
     snappedContour: smoothedSnapped,
     isClosed: false,
-    quads,
   };
 }
 
 /**
  * Executes the cutout on canvas: cleanly removes leftover background
- * up to the exact snapped object edge, leaving the subject untouched.
+ * up to the exact snapped object edge, leaving the subject completely untouched.
  */
 export function executeSnapCutout(
   ctx: CanvasRenderingContext2D,
   pairs: SnapPointPair[],
-  clearWidth: number = 40,
-  invertSide: boolean = false
+  clearWidth: number = 45,
+  invertSide: boolean = false,
+  forceClosed: boolean = false
 ): void {
-  const shape = computeCutoutShape(pairs, clearWidth, invertSide);
-  if (!shape) return;
+  const shape = computeCutoutShape(pairs, clearWidth, invertSide, forceClosed);
+  if (!shape || shape.polygonPoints.length < 3) return;
 
   ctx.save();
   ctx.globalCompositeOperation = 'destination-out';
-
-  if (shape.isClosed) {
-    // Erase inside the closed loop
-    ctx.beginPath();
-    ctx.moveTo(shape.snappedContour[0].x, shape.snappedContour[0].y);
-    for (let i = 1; i < shape.snappedContour.length; i++) {
-      ctx.lineTo(shape.snappedContour[i].x, shape.snappedContour[i].y);
-    }
-    ctx.closePath();
-    ctx.fillStyle = '#000000';
-    ctx.fill();
-  } else {
-    // Fill each segment quad between snapped contour and outer perimeter
-    // Guarantees zero missed pixels along curves
-    for (const quad of shape.quads) {
-      ctx.beginPath();
-      ctx.moveTo(quad[0].x, quad[0].y);
-      ctx.lineTo(quad[1].x, quad[1].y);
-      ctx.lineTo(quad[2].x, quad[2].y);
-      ctx.lineTo(quad[3].x, quad[3].y);
-      ctx.closePath();
-      ctx.fillStyle = '#000000';
-      ctx.fill();
-    }
-
-    // Fill the master polygon
-    ctx.beginPath();
-    ctx.moveTo(shape.polygonPoints[0].x, shape.polygonPoints[0].y);
-    for (let i = 1; i < shape.polygonPoints.length; i++) {
-      ctx.lineTo(shape.polygonPoints[i].x, shape.polygonPoints[i].y);
-    }
-    ctx.closePath();
-    ctx.fillStyle = '#000000';
-    ctx.fill();
-
-    // Clean outer background margin circles to smoothly clear outward remnants
-    // (Notice these are strictly on outer points far into the background, NEVER touching the snapped edge)
-    const radius = Math.max(16, clearWidth * 0.45);
-    for (let i = 0; i < shape.polygonPoints.length / 2; i++) {
-      const p = shape.polygonPoints[shape.polygonPoints.length - 1 - i];
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
+  ctx.beginPath();
+  ctx.moveTo(shape.polygonPoints[0].x, shape.polygonPoints[0].y);
+  for (let i = 1; i < shape.polygonPoints.length; i++) {
+    ctx.lineTo(shape.polygonPoints[i].x, shape.polygonPoints[i].y);
   }
-
+  ctx.closePath();
+  ctx.fillStyle = '#000000';
+  ctx.fill();
   ctx.restore();
 }
 
 /**
- * Clips the canvas context so a brush centered at (cx, cy)
- * cannot cut past an edge at (snapX, snapY).
+ * Smart Background Color Eraser:
+ * Erases only pixels matching the sampled background color within tolerance.
+ * Automatically stops and preserves pixels that belong to the subject!
  */
-export function applyEdgeBarrier(
+export function eraseMatchingColorBrush(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
-  snapX: number,
-  snapY: number,
-  radius: number
+  radius: number,
+  targetColor: { r: number; g: number; b: number },
+  tolerance: number = 30
 ): void {
-  const dx = cx - snapX;
-  const dy = cy - snapY;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 0.1) return;
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
 
-  const nx = dx / dist;
-  const ny = dy / dist;
-  const tx = -ny;
-  const ty = nx;
-  const M = Math.max(radius * 4, 100);
+  const minX = Math.max(0, Math.floor(cx - radius));
+  const maxX = Math.min(width - 1, Math.ceil(cx + radius));
+  const minY = Math.max(0, Math.floor(cy - radius));
+  const maxY = Math.min(height - 1, Math.ceil(cy + radius));
+  const boxW = maxX - minX + 1;
+  const boxH = maxY - minY + 1;
 
-  ctx.beginPath();
-  // Half plane on the brush side of the tangent through (snapX, snapY)
-  ctx.moveTo(snapX + tx * M, snapY + ty * M);
-  ctx.lineTo(snapX - tx * M, snapY - ty * M);
-  ctx.lineTo(snapX - tx * M + nx * M, snapY - ty * M + ny * M);
-  ctx.lineTo(snapX + tx * M + nx * M, snapY + ty * M + ny * M);
-  ctx.closePath();
-  ctx.clip();
+  if (boxW <= 0 || boxH <= 0) return;
+
+  const imgData = ctx.getImageData(minX, minY, boxW, boxH);
+  const data = imgData.data;
+  const tolSq = (tolerance * 2.55) ** 2;
+  const radSq = radius * radius;
+  let changed = false;
+
+  for (let py = 0; py < boxH; py++) {
+    const actualY = minY + py;
+    const dy = actualY - cy;
+    const rowOffset = py * boxW;
+
+    for (let px = 0; px < boxW; px++) {
+      const actualX = minX + px;
+      const dx = actualX - cx;
+      const distSq = dx * dx + dy * dy;
+
+      if (distSq > radSq) continue;
+
+      const idx = (rowOffset + px) * 4;
+      const curA = data[idx + 3];
+      if (curA === 0) continue;
+
+      const curR = data[idx];
+      const curG = data[idx + 1];
+      const curB = data[idx + 2];
+
+      const colorDiffSq =
+        (curR - targetColor.r) ** 2 +
+        (curG - targetColor.g) ** 2 +
+        (curB - targetColor.b) ** 2;
+
+      if (colorDiffSq <= tolSq) {
+        // Feather near outer radius for soft, clean edge
+        const distRatio = Math.sqrt(distSq) / radius;
+        if (distRatio > 0.85) {
+          const factor = (1 - distRatio) / 0.15;
+          data[idx + 3] = Math.round(curA * (1 - factor));
+        } else {
+          data[idx + 3] = 0;
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    ctx.putImageData(imgData, minX, minY);
+  }
 }
